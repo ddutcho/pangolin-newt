@@ -1,18 +1,20 @@
 # Pangolin Newt Supervisor (PNS)
 
-Open-source installer per il client **Pangolin `newt`** su Linux con:
-- **servizio systemd** sempre attivo (restart automatico, hardening)
-- **wrapper** con retry/backoff e **logging** dedicato
+Installer per il client **Pangolin `newt`** su Linux con:
+- **servizio systemd** sempre attivo (restart automatico + hardening)
+- **wrapper** con retry/backoff e **logging**
 - **health-check timer** (rialza il servizio se cade)
 - **installazione interattiva** (chiede `NEWT_ID`, `NEWT_SECRET`, `NEWT_ENDPOINT`)
 - flag integrati `--native --accept-clients`
-- modalità **non-interattiva** via variabili d’ambiente e **uninstall** pulita
+- supporto **non-interattivo** e **disinstallazione** pulita
+
+> Requisiti: Debian/Ubuntu (o derivate) con `systemd`, permessi `root` (o `sudo`), connettività Internet.
 
 ---
 
-## Method 1 – Linux (curl|bash) ❤️
+## Installazione (minimale)
 
-Apri il terminale su Debian/Ubuntu (con `systemd`) e incolla:
-
+### Metodo A — Ho già i file localmente
+Esegui dalla cartella dove si trova `pangolin-newt-setup.sh`:
 ```bash
-bash -c 'read -p "GitHub owner/repo (tuo): " REPO; curl -fsSL "https://raw.githubusercontent.com/${REPO}/main/scripts/pangolin-bootstrap.sh" | bash'
+bash pangolin-newt-setup.sh --install
