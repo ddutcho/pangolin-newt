@@ -1,272 +1,245 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# === Percorsi ===
-ENV_DIR="/etc/newt"
-ENV_FILE="${ENV_DIR}/newt.env"
-WRAPPER="/usr/local/bin/newt-client.sh"
-HEALTHCHECK="/usr/local/bin/newt-healthcheck.sh"
-LOG_FILE="/var/log/newt-client.log"
-UNIT_FILE="/etc/systemd/system/newt.service"
-TIMER_FILE="/etc/systemd/system/newt-healthcheck.timer"
-HC_SERVICE_FILE="/etc/systemd/system/newt-healthcheck.service"
+# setup-newt.sh — Installazione Newt + servizio systemd + healthcheck
+# Testato su Ubuntu/Debian systemd. Richiede privilegi root.
 
-log(){ echo -e "[newt-setup] $*"; }
-need_cmd(){
-  command -v "$1" >/dev/null 2>&1 || {
-    log "Installo $1 ..."
-    if command -v sudo >/dev/null 2>&1; then
-      sudo apt-get update -y && sudo apt-get install -y "$1"
-    else
-      apt-get update -y && apt-get install -y "$1"
+assert_root() {
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    echo "Devi eseguire questo script come root (sudo)." >&2
+    exit 1
+  fi
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || { echo "Comando richiesto non trovato: $1" >&2; exit 1; }
+}
+
+confirm() {
+  local prompt="${1:-Confermi?} [s/N]: "
+  read -r -p "$prompt" ans || true
+  [[ "${ans,,}" == "s" || "${ans,,}" == "si" || "${ans,,}" == "y" || "${ans,,}" == "yes" ]]
+}
+
+install_newt_if_missing() {
+  if ! command -v newt >/dev/null 2>&1; then
+    echo "Newt non trovato, procedo con l'installer ufficiale..."
+    curl -fsSL https://digpangolin.com/get-newt.sh | bash
+    if ! command -v newt >/dev/null 2>&1; then
+      echo "Errore: installazione di Newt fallita." >&2
+      exit 1
     fi
-  }
-}
-assert_root(){
-  if [[ $EUID -ne 0 ]]; then
-    if command -v sudo >/dev/null 2>&1; then
-      exec sudo -E bash "$0" "$@"
-    else
-      echo "Serve root o sudo. Interrompo." >&2; exit 1
-    fi
-  fi
-}
-
-print_help(){
-cat <<'EOF'
-Uso:
-  pangolin-newt-setup.sh [--install|--uninstall|--status|--logs] [--non-interactive]
-
-Non-interactive richiede:
-  NEWT_ID, NEWT_SECRET, NEWT_ENDPOINT
-
-Azioni:
-  --install    Installa/aggiorna newt + servizio systemd (default)
-  --uninstall  Rimuove servizio/timer/script (lascia .env e log)
-  --status     Mostra lo stato dei servizi
-  --logs       Segue i log del servizio
-EOF
-}
-
-ACTION="install"; NON_INTERACTIVE="false"
-for a in "$@"; do
-  case "$a" in
-    --install) ACTION="install";;
-    --uninstall) ACTION="uninstall";;
-    --status) ACTION="status";;
-    --logs) ACTION="logs";;
-    --non-interactive) NON_INTERACTIVE="true";;
-    -h|--help) print_help; exit 0;;
-  esac
-done
-
-prompt_nonempty(){
-  local p="$1" v
-  if [[ "${2:-}" == "silent" ]]; then
-    while true; do read -r -s -p "$p" v || true; echo; [[ -n "$v" ]] && break; echo "Il valore non può essere vuoto."; done
   else
-    while true; do read -r -p "$p" v || true; [[ -n "$v" ]] && break; echo "Il valore non può essere vuoto."; done
+    echo "Newt è già installato in $(command -v newt)"
   fi
-  REPLY="$v"
 }
 
-do_install(){
-  assert_root "$@"
-  need_cmd curl
-  need_cmd bash
-  need_cmd systemctl
+prompt_inputs() {
+  echo "== Parametri di connessione a Pangolin/Newt =="
+  read -r -p "Endpoint (es. https://pangolin.tuodominio.tld): " PANGOLIN_ENDPOINT
+  read -r -p "Newt ID: " NEWT_ID
+  read -r -s -p "Newt Secret: " NEWT_SECRET; echo
 
-  # 0) Credenziali: sempre richieste all'inizio (interattivo) o lette da env (non-interattivo)
-  local NEWT_ID NEWT_SECRET NEWT_ENDPOINT
-  if [[ "$NON_INTERACTIVE" == "true" ]]; then
-    : "${NEWT_ID:?NEWT_ID mancante}"
-    : "${NEWT_SECRET:?NEWT_SECRET mancante}"
-    : "${NEWT_ENDPOINT:?NEWT_ENDPOINT mancante}"
+  # Opzioni avanzate
+  echo "== Opzioni avanzate =="
+  if confirm "Abilitare --accept-clients (consente connessioni client al tuo Newt)?"; then
+    ACCEPT_CLIENTS=true
   else
-    echo "== Configura credenziali Pangolin Newt =="
-    prompt_nonempty "NEWT_ID: " ; NEWT_ID="$REPLY"
-    prompt_nonempty "NEWT_SECRET (nascosto): " silent ; NEWT_SECRET="$REPLY"
-    prompt_nonempty "NEWT_ENDPOINT (es. https://pangolin.vosic.fun): " ; NEWT_ENDPOINT="$REPLY"
-    echo "Riepilogo: ID=$NEWT_ID  ENDPOINT=$NEWT_ENDPOINT"
-    read -r -p "Confermi? [s/N]: " C; [[ "${C,,}" =~ ^(s|si|sì|y|yes)$ ]] || { echo "Annullato."; exit 1; }
+    ACCEPT_CLIENTS=false
   fi
 
-  # 1) Installa/aggiorna il client newt (script ufficiale)
-  log "Installo/aggiorno il client newt..."
-  bash -c 'curl -fsSL https://digpangolin.com/get-newt.sh | bash'
-
-  # 2) Scrive env sicuro
-  log "Scrivo ${ENV_FILE} ..."
-  mkdir -p "$ENV_DIR"; chmod 0750 "$ENV_DIR"; umask 0077
-  cat > "$ENV_FILE" <<EOF
-NEWT_ID="${NEWT_ID}"
-NEWT_SECRET="${NEWT_SECRET}"
-NEWT_ENDPOINT="${NEWT_ENDPOINT}"
-EOF
-  chmod 0640 "$ENV_FILE"
-
-  # 3) Wrapper con retry/backoff + logging (flag: --native --accept-clients)
-  log "Creo wrapper ${WRAPPER} ..."
-  cat > "$WRAPPER" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-ENV_FILE="/etc/newt/newt.env"
-LOG_FILE="/var/log/newt-client.log"
-
-if [[ ! -f "$ENV_FILE" ]]; then
-  echo "[newt-client] Manca $ENV_FILE" >&2; exit 1
-fi
-
-# shellcheck disable=SC1090
-source "$ENV_FILE"
-
-if ! command -v newt >/dev/null 2>&1; then
-  echo "[newt-client] 'newt' non trovato nel PATH" >&2; exit 2
-fi
-
-mkdir -p "$(dirname "$LOG_FILE")"; touch "$LOG_FILE"; chmod 0640 "$LOG_FILE"
-exec >> "$LOG_FILE" 2>&1
-
-echo "[$(date -Iseconds)] Avvio newt (native, accept-clients) -> ${NEWT_ENDPOINT}"
-
-child_pid=""
-cleanup(){
-  if [[ -n "${child_pid:-}" ]] && kill -0 "$child_pid" 2>/dev/null; then
-    echo "[$(date -Iseconds)] Stop richiesto, termino (SIGTERM) pid=$child_pid"
-    kill -TERM "$child_pid" || true
-    wait "$child_pid" || true
+  if confirm "Usare modalità --native (interfaccia WireGuard del kernel, Linux only, richiede privilegi elevati)?"; then
+    USE_NATIVE=true
+  else
+    USE_NATIVE=false
   fi
-  echo "[$(date -Iseconds)] Uscita wrapper"
+
+  read -r -p "Percorso file di health (default: /run/newt/healthy): " HEALTH_FILE_INPUT || true
+  HEALTH_FILE="${HEALTH_FILE_INPUT:-/run/newt/healthy}"
+
+  # Validazioni minime
+  if [[ -z "$PANGOLIN_ENDPOINT" || -z "$NEWT_ID" || -z "$NEWT_SECRET" ]]; then
+    echo "Endpoint/ID/Secret non possono essere vuoti." >&2
+    exit 1
+  fi
+  if [[ ! "$PANGOLIN_ENDPOINT" =~ ^https?:// ]]; then
+    echo "Endpoint deve iniziare con http:// o https://." >&2
+    exit 1
+  fi
 }
-trap cleanup SIGINT SIGTERM
 
-backoff=2; max_backoff=60
-while true; do
-  set +e
-  newt --id "${NEWT_ID}" \
-       --secret "${NEWT_SECRET}" \
-       --endpoint "${NEWT_ENDPOINT}" \
-       --native --accept-clients &
-  child_pid=$!; wait "$child_pid"; ec=$?
-  set -e
+create_system_user() {
+  if ! id -u newt >/dev/null 2>&1; then
+    useradd -r -s /usr/sbin/nologin -d /var/lib/newt newt
+  fi
+  mkdir -p /var/lib/newt /etc/newt /var/log/newt
+  chown -R newt:newt /var/lib/newt /var/log/newt
+  chmod 0750 /var/lib/newt /var/log/newt
+}
 
-  echo "[$(date -Iseconds)] 'newt' uscito con codice ${ec}"
+write_config() {
+  # Conserviamo credenziali in /etc/newt/config.json e le passiamo con CONFIG_FILE
+  cat >/etc/newt/config.json <<JSON
+{
+  "id": "$(printf '%s' "$NEWT_ID")",
+  "secret": "$(printf '%s' "$NEWT_SECRET")",
+  "endpoint": "$(printf '%s' "$PANGOLIN_ENDPOINT")",
+  "tlsClientCert": ""
+}
+JSON
+  chmod 0600 /etc/newt/config.json
+  chown root:root /etc/newt/config.json
 
-  if [[ $ec -eq 0 ]]; then
-    sleep 2; backoff=2; continue
+  # Environment file per flag opzionali
+  cat >/etc/newt/newt.env <<ENV
+CONFIG_FILE=/etc/newt/config.json
+HEALTH_FILE=${HEALTH_FILE}
+# Log level (DEBUG, INFO, WARN, ERROR, FATAL)
+LOG_LEVEL=INFO
+# Abilita accettazione client se richiesto
+ACCEPT_CLIENTS=${ACCEPT_CLIENTS}
+# Modalità native (solo Linux; richiede CAP_NET_ADMIN)
+USE_NATIVE_INTERFACE=${USE_NATIVE}
+# Nome interfaccia WG in native mode (opzionale)
+INTERFACE=newt
+ENV
+  chmod 0640 /etc/newt/newt.env
+}
+
+write_service_units() {
+  local run_user="newt"
+  local caps=""
+  local supp_groups=""
+
+  if [[ "${USE_NATIVE}" == "true" ]]; then
+    # In native mode servono privilegi (creazione interfaccia WG)
+    run_user="root"
+    caps="CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW"
   fi
 
-  sleep "$backoff"
-  if [[ $backoff -lt $max_backoff ]]; then
-    backoff=$(( backoff * 2 ))
-    (( backoff > max_backoff )) && backoff=$max_backoff
-  fi
-done
-EOF
-  chmod 0755 "$WRAPPER"
-
-  # 4) Healthcheck
-  log "Creo healthcheck ${HEALTHCHECK} ..."
-  cat > "$HEALTHCHECK" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-UNIT="newt.service"
-if ! systemctl is-active --quiet "$UNIT"; then
-  echo "[$(date -Iseconds)] $UNIT non attivo: provo restart"
-  systemctl restart "$UNIT" || true
-  exit 1
-fi
-exit 0
-EOF
-  chmod 0755 "$HEALTHCHECK"
-
-  # 5) Servizio systemd + hardening
-  log "Creo unit systemd ${UNIT_FILE} ..."
-  cat > "$UNIT_FILE" <<EOF
+  # Servizio principale
+  cat >/etc/systemd/system/newt.service <<UNIT
 [Unit]
-Description=Pangolin newt - client persistente
-Wants=network-online.target
+Description=Newt (Pangolin) client
 After=network-online.target
+Wants=network-online.target systemd-networkd-wait-online.service
 
 [Service]
-Type=simple
-User=root
-Group=root
-EnvironmentFile=${ENV_FILE}
-ExecStart=${WRAPPER}
+User=${run_user}
+Group=${run_user}
+EnvironmentFile=/etc/newt/newt.env
+# Crea /run/newt/ per HEALTH_FILE
+RuntimeDirectory=newt
+RuntimeDirectoryMode=0755
+# Esegue il binario senza credenziali in argomenti (le prende da CONFIG_FILE)
+ExecStart=$(command -v newt)
 Restart=always
-RestartSec=5
-StartLimitIntervalSec=300
-StartLimitBurst=50
-
-# Hardening & risorse
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=full
-ProtectHome=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
-LockPersonality=true
-MemoryDenyWriteExecute=true
-ReadWritePaths=/var/log /etc/newt
-Nice=5
-IOSchedulingClass=best-effort
-IOSchedulingPriority=6
+RestartSec=3
+# Limiti e logging
+LimitNOFILE=65535
+StandardOutput=journal
+StandardError=journal
+${caps}
+# Ferma pulito
+KillSignal=SIGTERM
+TimeoutStopSec=15
 
 [Install]
 WantedBy=multi-user.target
-EOF
+UNIT
 
-  # 6) Timer healthcheck ogni 60s
-  log "Creo healthcheck timer ..."
-  cat > "$HC_SERVICE_FILE" <<EOF
+  # Healthcheck script: se HEALTH_FILE manca o è vecchio, riavvia newt
+  cat >/usr/local/sbin/newt-healthcheck.sh <<'HCSH'
+#!/usr/bin/env bash
+set -euo pipefail
+HEALTH_FILE="${HEALTH_FILE:-/run/newt/healthy}"
+STALE_AFTER="${STALE_AFTER:-45}"
+
+if [[ ! -e "$HEALTH_FILE" ]]; then
+  systemctl restart newt.service
+  exit 1
+fi
+
+now=$(date +%s)
+# stat -c %Y (GNU); fallback per BSD/macOS non serve qui
+mtime=$(stat -c %Y "$HEALTH_FILE")
+age=$(( now - mtime ))
+if (( age > STALE_AFTER )); then
+  systemctl restart newt.service
+  exit 2
+fi
+exit 0
+HCSH
+  chmod 0755 /usr/local/sbin/newt-healthcheck.sh
+
+  # Service oneshot del healthcheck
+  cat >/etc/systemd/system/newt-healthcheck.service <<HCS
 [Unit]
-Description=Pangolin newt - healthcheck
+Description=Healthcheck per Newt (riavvia se unhealthy)
+After=newt.service
 
 [Service]
 Type=oneshot
-ExecStart=${HEALTHCHECK}
-EOF
+EnvironmentFile=/etc/newt/newt.env
+ExecStart=/usr/local/sbin/newt-healthcheck.sh
+HCS
 
-  cat > "$TIMER_FILE" <<EOF
+  # Timer ogni 30s
+  cat >/etc/systemd/system/newt-healthcheck.timer <<HCT
 [Unit]
-Description=Pangolin newt - healthcheck timer
+Description=Esegui healthcheck Newt ogni 30 secondi
 
 [Timer]
-OnBootSec=30
-OnUnitActiveSec=60
-Unit=$(basename "${HC_SERVICE_FILE}")
+OnBootSec=30s
+OnUnitActiveSec=30s
+AccuracySec=5s
+Unit=newt-healthcheck.service
 
 [Install]
 WantedBy=timers.target
-EOF
+HCT
 
-  # 7) Abilita e avvia
-  log "Abilito e avvio servizi ..."
   systemctl daemon-reload
-  systemctl enable newt.service newt-healthcheck.timer
-  systemctl start newt.service newt-healthcheck.timer
-
-  log "Installazione completata."
-  echo "Comandi: systemctl status newt.service | journalctl -u newt.service -f | tail -f ${LOG_FILE}"
+  systemctl enable --now newt.service
+  systemctl enable --now newt-healthcheck.timer
 }
 
-do_uninstall(){
-  assert_root "$@"
-  systemctl stop newt-healthcheck.timer newt.service || true
-  systemctl disable newt-healthcheck.timer newt.service || true
-  rm -f "$UNIT_FILE" "$TIMER_FILE" "$HC_SERVICE_FILE" "$WRAPPER" "$HEALTHCHECK"
-  systemctl daemon-reload
-  echo "Disinstallazione completata. (Mantengo ${ENV_FILE} e ${LOG_FILE})"
+summary() {
+  echo
+  echo "== Installazione completata =="
+  echo "Endpoint:        $PANGOLIN_ENDPOINT"
+  echo "Accept clients:  $ACCEPT_CLIENTS"
+  echo "Native mode:     $USE_NATIVE"
+  echo "Health file:     $HEALTH_FILE"
+  echo
+  echo "Comandi utili:"
+  echo "  systemctl status newt.service"
+  echo "  journalctl -u newt.service -f"
+  echo "  systemctl list-timers | grep newt-healthcheck"
+  echo "  journalctl -u newt-healthcheck.service -f"
+  echo
+  echo "File:"
+  echo "  /etc/newt/config.json     (credenziali)"
+  echo "  /etc/newt/newt.env        (opzioni e HEALTH_FILE)"
+  echo "  /usr/local/sbin/newt-healthcheck.sh"
+  echo "  /etc/systemd/system/newt.service"
+  echo "  /etc/systemd/system/newt-healthcheck.service"
+  echo "  /etc/systemd/system/newt-healthcheck.timer"
 }
-do_status(){ systemctl --no-pager status newt.service || true; echo; systemctl --no-pager status newt-healthcheck.timer || true; }
-do_logs(){ journalctl -u newt.service -f; }
 
-case "$ACTION" in
-  install) do_install "$@";;
-  uninstall) do_uninstall "$@";;
-  status) do_status;;
-  logs) do_logs;;
-  *) print_help; exit 1;;
-esac
+main() {
+  assert_root
+  need_cmd curl
+  need_cmd stat
+  need_cmd systemctl
+
+  install_newt_if_missing
+  prompt_inputs
+  create_system_user
+  write_config
+  write_service_units
+  summary
+}
+
+main "$@"
